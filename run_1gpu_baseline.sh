@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+set -euo pipefail
+cd "$(dirname "$0")"
+
+export WANDB_PROJECT="${WANDB_PROJECT:-modded-nanogpt}"
+export WANDB_RUN_NAME="${WANDB_RUN_NAME:-baseline-h100-1gpu}"
+export WANDB_RUN_ID="${WANDB_RUN_ID:-$(uuidgen | tr '[:upper:]' '[:lower:]')}"
+
+if [[ -z "${WANDB_API_KEY:-}" ]] && security find-generic-password -a "$USER" -s wandb-api-key -w &>/dev/null; then
+  export WANDB_API_KEY="$(security find-generic-password -a "$USER" -s wandb-api-key -w)"
+fi
+
+# 1x H100: keep global batch 512 (8*64) via gradient accumulation.
+torchrun --standalone --nproc_per_node=1 train_gpt2.py

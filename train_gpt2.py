@@ -340,7 +340,7 @@ class Hyperparameters:
     input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
+    batch_size : int = 8*64 # batch size, in sequences, across all devices (512 for 8-GPU or 1-GPU+accum)
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 5100 # number of iterations to run
@@ -354,6 +354,20 @@ class Hyperparameters:
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
+def maybe_init_wandb(run_id):
+  api_key = os.environ.get('WANDB_API_KEY')
+  if not api_key:
+    return None
+  import wandb
+  wandb.login(key=api_key, relogin=True)
+  return wandb.init(
+    project=os.environ.get('WANDB_PROJECT', 'modded-nanogpt'),
+    name=os.environ.get('WANDB_RUN_NAME', run_id),
+    id=os.environ.get('WANDB_RUN_ID', run_id),
+    config=vars(args),
+    resume='allow',
+  )
+
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
 dist.init_process_group(backend='nccl')
@@ -364,6 +378,7 @@ device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+wandb_run = None
 
 # convenience variables
 B, T = args.device_batch_size, args.sequence_length
@@ -423,6 +438,7 @@ if master_process:
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
     # create the log file
+    wandb_run = maybe_init_wandb(run_id)
     with open(logfile, "w") as f:
         # begin the log by printing this file (the Python code)
         f.write('='*100 + '\n')
@@ -474,6 +490,12 @@ for step in range(args.num_iterations + 1):
             print(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms')
             with open(logfile, "a") as f:
                 f.write(f'step:{step}/{args.num_iterations} val_loss:{val_loss:.4f} train_time:{training_time_ms:.0f}ms step_avg:{training_time_ms/(timed_steps-1):.2f}ms\n')
+            if wandb_run is not None:
+                wandb_run.log({
+                    'val_loss': float(val_loss),
+                    'train_time_ms': training_time_ms,
+                    'step_avg_ms': training_time_ms / (timed_steps - 1),
+                }, step=step)
         # start the clock again
         torch.cuda.synchronize()
         t0 = time.time()
@@ -528,8 +550,16 @@ for step in range(args.num_iterations + 1):
         print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
         with open(logfile, "a") as f:
             f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+        if wandb_run is not None:
+            wandb_run.log({
+                'train_loss': float(train_loss.item()),
+                'train_time_ms': approx_time,
+                'step_avg_ms': approx_time / timed_steps,
+            }, step=step + 1)
 
 if master_process:
+    if wandb_run is not None:
+        wandb_run.finish()
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
 
 # -------------------------------------------------------------------------
