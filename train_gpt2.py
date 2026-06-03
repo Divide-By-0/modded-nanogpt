@@ -2,9 +2,11 @@ import os
 import sys
 with open(sys.argv[0]) as f:
     code = f.read() # read the code of this file ASAP, for logging
+import random
 import uuid
 import glob
 import time
+import subprocess
 from dataclasses import dataclass
 
 import numpy as np
@@ -160,6 +162,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.head_dim = self.n_embd // self.n_head
+        self.qk_norm_mode = config.qk_norm_mode
         assert self.n_embd % self.n_head == 0
         self.c_q = nn.Linear(self.n_embd, self.n_embd, bias=False)
         self.c_k = nn.Linear(self.n_embd, self.n_embd, bias=False)
@@ -175,8 +178,16 @@ class CausalSelfAttention(nn.Module):
         k = self.c_k(x).view(B, T, self.n_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_head, self.head_dim)
         cos, sin = self.rotary(q)
-        q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
-        q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        if self.qk_norm_mode == 'before_rope':
+            q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),)) # QK norm suggested by @Grad62304977
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        elif self.qk_norm_mode == 'after_rope':
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+            q, k = F.rms_norm(q, (q.size(-1),)), F.rms_norm(k, (k.size(-1),))
+        elif self.qk_norm_mode == 'off':
+            q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
+        else:
+            raise ValueError(f"unknown qk_norm_mode: {self.qk_norm_mode}")
         y = F.scaled_dot_product_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), is_causal=True)
         y = y.transpose(1, 2).contiguous().view_as(x) # re-assemble all head outputs side by side
         y = self.c_proj(y)
@@ -217,6 +228,8 @@ class GPTConfig:
     n_layer : int = 12
     n_head : int = 6 # head dim 128 suggested by @Grad62304977
     n_embd : int = 768
+    qk_norm_mode : str = 'before_rope'
+    embed_rmsnorm : bool = False
 
 class GPT(nn.Module):
 
@@ -235,6 +248,8 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         x = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        if self.config.embed_rmsnorm:
+            x = F.rms_norm(x, (x.size(-1),))
         for block in self.transformer.h:
             x = block(x)
         x = F.rms_norm(x, (x.size(-1),))
@@ -349,24 +364,78 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end; override with VAL_LOSS_EVERY
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
 
-def maybe_init_wandb(run_id):
+def env_bool(name, default=False):
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+
+if (val_loss_every_env := os.environ.get('VAL_LOSS_EVERY')) is not None:
+    args.val_loss_every = int(val_loss_every_env)
+if (learning_rate_env := os.environ.get('LEARNING_RATE')) is not None:
+    args.learning_rate = float(learning_rate_env)
+if (warmup_iters_env := os.environ.get('WARMUP_ITERS')) is not None:
+    args.warmup_iters = int(warmup_iters_env)
+if (warmdown_iters_env := os.environ.get('WARMDOWN_ITERS')) is not None:
+    args.warmdown_iters = int(warmdown_iters_env)
+if (weight_decay_env := os.environ.get('WEIGHT_DECAY')) is not None:
+    args.weight_decay = float(weight_decay_env)
+
+train_seed = int(os.environ.get('TRAIN_SEED', '1337'))
+max_train_seconds = float(os.environ.get('MAX_TRAIN_SECONDS', '0'))
+ab_tag = os.environ.get('AB_TAG', '')
+experiment_desc = os.environ.get('EXPERIMENT_DESC', '')
+profile_one_step = env_bool('PROFILE_ONE_STEP', False)
+profile_output_dir = os.environ.get('PROFILE_OUTPUT_DIR', 'logs/profile')
+optimizer_mode = os.environ.get('OPTIMIZER_MODE', 'muon_adamw').strip().lower()
+muon_lr_multiplier = float(os.environ.get('MUON_LR_MULTIPLIER', '0.1'))
+muon_momentum = float(os.environ.get('MUON_MOMENTUM', '0.95'))
+muon_nesterov = env_bool('MUON_NESTEROV', True)
+muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', '5'))
+qk_norm_mode = os.environ.get('QK_NORM_MODE', 'before_rope').strip().lower()
+embed_rmsnorm = env_bool('EMBED_RMSNORM', False)
+torch_compile_mode = os.environ.get('TORCH_COMPILE_MODE', '').strip() or None
+torch_compile_options = {}
+if (compile_gemm_backends := os.environ.get('TORCH_COMPILE_MAX_AUTOTUNE_GEMM_BACKENDS')) is not None:
+    torch_compile_options['max_autotune'] = True
+    torch_compile_options['max_autotune_gemm_backends'] = compile_gemm_backends
+if qk_norm_mode not in ('before_rope', 'after_rope', 'off'):
+    raise ValueError(f"QK_NORM_MODE must be before_rope, after_rope, or off; got {qk_norm_mode!r}")
+
+def set_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+def maybe_init_wandb(run_id, run_config=None):
   api_key = os.environ.get('WANDB_API_KEY')
   if not api_key:
     return None
   import wandb
   wandb.login(key=api_key, relogin=True)
+  config = dict(vars(args))
+  if run_config:
+    config.update(run_config)
   return wandb.init(
     project=os.environ.get('WANDB_PROJECT', 'modded-nanogpt'),
     name=os.environ.get('WANDB_RUN_NAME', run_id),
     id=os.environ.get('WANDB_RUN_ID', run_id),
-    config=vars(args),
+    config=config,
     resume='allow',
   )
+
+def build_ab_dashboard():
+    repo_root = os.path.dirname(os.path.abspath(__file__))
+    script = os.path.join(repo_root, 'scripts', 'ab_dashboard.py')
+    if not os.path.isfile(script):
+        return
+    subprocess.run([sys.executable, script], cwd=repo_root, check=False)
 
 # set up DDP (distributed data parallel). torchrun sets this env variable
 assert torch.cuda.is_available()
@@ -378,6 +447,9 @@ device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+set_seed(train_seed)
+if master_process:
+    print(f"train_seed={train_seed} max_train_seconds={max_train_seconds} ab_tag={ab_tag!r} experiment_desc={experiment_desc!r}")
 wandb_run = None
 
 # convenience variables
@@ -395,27 +467,48 @@ val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world
 if master_process:
     print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
     print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
+    print(f"val_loss_every={args.val_loss_every} val_steps={val_steps} val_tokens={args.val_tokens} train_accumulation_steps={train_accumulation_steps}")
+    print(f"optimizer_mode={optimizer_mode} muon_lr_multiplier={muon_lr_multiplier} muon_momentum={muon_momentum} muon_backend_steps={muon_backend_steps} qk_norm_mode={qk_norm_mode} embed_rmsnorm={embed_rmsnorm} torch_compile_mode={torch_compile_mode} torch_compile_options={torch_compile_options}")
 x, y = train_loader.next_batch()
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
 num_vocab = 50304
-model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
+model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768,
+                      qk_norm_mode=qk_norm_mode, embed_rmsnorm=embed_rmsnorm))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+torch_compile_kwargs = {}
+if torch_compile_options:
+    torch_compile_kwargs['options'] = torch_compile_options
+elif torch_compile_mode:
+    torch_compile_kwargs['mode'] = torch_compile_mode
+model = torch.compile(model, **torch_compile_kwargs)
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
 ctx = torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16)
 
 # init the optimizer(s)
-optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
-                               weight_decay=args.weight_decay, fused=True)
-optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=0.1*args.learning_rate, momentum=0.95,
-                  rank=ddp_rank, world_size=ddp_world_size)
-optimizers = [optimizer1, optimizer2]
+if optimizer_mode == 'muon_adamw':
+    optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+                                   weight_decay=args.weight_decay, fused=True)
+    optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=muon_lr_multiplier*args.learning_rate,
+                      momentum=muon_momentum, nesterov=muon_nesterov,
+                      backend_steps=muon_backend_steps, rank=ddp_rank, world_size=ddp_world_size)
+    optimizers = [optimizer1, optimizer2]
+elif optimizer_mode == 'adamw_all':
+    optimizers = [torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+                                    weight_decay=args.weight_decay, fused=True)]
+elif optimizer_mode == 'sgd_momentum':
+    optimizer1 = torch.optim.AdamW(raw_model.lm_head.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
+                                   weight_decay=args.weight_decay, fused=True)
+    optimizer2 = torch.optim.SGD(raw_model.transformer.h.parameters(), lr=muon_lr_multiplier*args.learning_rate,
+                                 momentum=muon_momentum, nesterov=muon_nesterov)
+    optimizers = [optimizer1, optimizer2]
+else:
+    raise ValueError(f"unknown OPTIMIZER_MODE: {optimizer_mode}")
 # learning rate decay scheduler (linear warmup and warmdown)
 def get_lr(it):
     assert it <= args.num_iterations
@@ -431,6 +524,46 @@ def get_lr(it):
         return decay_ratio
 schedulers = [torch.optim.lr_scheduler.LambdaLR(opt, get_lr) for opt in optimizers]
 
+def run_eval_one_batch(x_val, y_val):
+    model.eval()
+    with ctx:
+        _, loss = model(x_val, y_val, return_logits=False)
+    return loss.detach()
+
+def run_train_step(x, y):
+    model.train()
+    train_loss = None
+    for i in range(1, train_accumulation_steps+1):
+        with ctx:
+            _, loss = model(x, y, return_logits=False)
+            train_loss = loss.detach()
+        x, y = train_loader.next_batch()
+        if i < train_accumulation_steps:
+            with model.no_sync(): # there's no need to sync gradients every accumulation step
+                loss.backward()
+        else:
+            loss.backward() # just sync on the last step
+    for p in model.parameters():
+        if p.grad is not None:
+            p.grad /= train_accumulation_steps
+    for opt, sched in zip(optimizers, schedulers):
+        opt.step()
+        sched.step()
+    model.zero_grad(set_to_none=True)
+    return x, y, train_loss
+
+def profiler_activities():
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if torch.cuda.is_available():
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
+    return activities
+
+def write_profiler_table(prof, path, sort_by='cuda_time_total', row_limit=40):
+    table = prof.key_averages().table(sort_by=sort_by, row_limit=row_limit)
+    with open(path, 'w') as f:
+        f.write(table)
+    return table
+
 # begin logging
 if master_process:
     run_id = str(uuid.uuid4())
@@ -438,8 +571,44 @@ if master_process:
     os.makedirs(logdir, exist_ok=True)
     logfile = 'logs/%s.txt' % run_id
     # create the log file
-    wandb_run = maybe_init_wandb(run_id)
+    wandb_run = maybe_init_wandb(run_id, {
+        'ab_tag': ab_tag,
+        'experiment_desc': experiment_desc,
+        'train_seed': train_seed,
+        'max_train_seconds': max_train_seconds,
+        'learning_rate': args.learning_rate,
+        'warmup_iters': args.warmup_iters,
+        'warmdown_iters': args.warmdown_iters,
+        'weight_decay': args.weight_decay,
+        'optimizer_mode': optimizer_mode,
+        'muon_lr_multiplier': muon_lr_multiplier,
+        'muon_momentum': muon_momentum,
+        'muon_nesterov': muon_nesterov,
+        'muon_backend_steps': muon_backend_steps,
+        'qk_norm_mode': qk_norm_mode,
+        'embed_rmsnorm': embed_rmsnorm,
+        'torch_compile_mode': torch_compile_mode or '',
+        'torch_compile_options': str(torch_compile_options),
+    })
     with open(logfile, "w") as f:
+        f.write(f"ab_tag:{ab_tag}\n")
+        f.write(f"experiment_desc:{experiment_desc}\n")
+        f.write(f"train_seed:{train_seed}\n")
+        f.write(f"max_train_seconds:{max_train_seconds}\n")
+        f.write(f"learning_rate:{args.learning_rate}\n")
+        f.write(f"warmup_iters:{args.warmup_iters}\n")
+        f.write(f"warmdown_iters:{args.warmdown_iters}\n")
+        f.write(f"weight_decay:{args.weight_decay}\n")
+        f.write(f"optimizer_mode:{optimizer_mode}\n")
+        f.write(f"muon_lr_multiplier:{muon_lr_multiplier}\n")
+        f.write(f"muon_momentum:{muon_momentum}\n")
+        f.write(f"muon_nesterov:{muon_nesterov}\n")
+        f.write(f"muon_backend_steps:{muon_backend_steps}\n")
+        f.write(f"qk_norm_mode:{qk_norm_mode}\n")
+        f.write(f"embed_rmsnorm:{embed_rmsnorm}\n")
+        f.write(f"torch_compile_mode:{torch_compile_mode or ''}\n")
+        f.write(f"torch_compile_options:{torch_compile_options}\n")
+        f.write(f"wandb_run_name:{os.environ.get('WANDB_RUN_NAME', run_id)}\n")
         # begin the log by printing this file (the Python code)
         f.write('='*100 + '\n')
         f.write(code)
@@ -452,13 +621,101 @@ if master_process:
         f.write(f'{result.stdout}\n')
         f.write('='*100 + '\n')
 
+if profile_one_step:
+    profile_dir = os.path.abspath(profile_output_dir)
+    if master_process:
+        os.makedirs(profile_dir, exist_ok=True)
+        print(f"PROFILE_ONE_STEP=1; writing profiler output to {profile_dir}")
+
+    train_loader.reset()
+    val_loader.reset()
+    x, y = train_loader.next_batch()
+    x_val, y_val = val_loader.next_batch()
+
+    # Warm up compile graphs and optimizer state so the profile reflects steady-state kernels.
+    _ = run_eval_one_batch(x_val, y_val)
+    x, y, _ = run_train_step(x, y)
+    torch.cuda.synchronize()
+
+    x_val, y_val = val_loader.next_batch()
+    eval_start = time.time()
+    with torch.profiler.profile(
+        activities=profiler_activities(),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as eval_prof:
+        with torch.profiler.record_function("eval_one_batch"):
+            eval_loss = run_eval_one_batch(x_val, y_val)
+    torch.cuda.synchronize()
+    eval_wall_ms = 1000 * (time.time() - eval_start)
+
+    train_start = time.time()
+    with torch.profiler.profile(
+        activities=profiler_activities(),
+        record_shapes=True,
+        profile_memory=True,
+        with_stack=False,
+    ) as train_prof:
+        with torch.profiler.record_function("train_one_accumulated_step"):
+            x, y, train_loss = run_train_step(x, y)
+    torch.cuda.synchronize()
+    train_wall_ms = 1000 * (time.time() - train_start)
+
+    eval_rank_path = os.path.join(profile_dir, f'eval_rank{ddp_rank}.json')
+    train_rank_path = os.path.join(profile_dir, f'train_rank{ddp_rank}.json')
+    eval_prof.export_chrome_trace(eval_rank_path)
+    train_prof.export_chrome_trace(train_rank_path)
+
+    if master_process:
+        eval_table_path = os.path.join(profile_dir, 'eval_top_cuda.txt')
+        train_table_path = os.path.join(profile_dir, 'train_top_cuda.txt')
+        eval_table = write_profiler_table(eval_prof, eval_table_path, row_limit=30)
+        train_table = write_profiler_table(train_prof, train_table_path, row_limit=50)
+        summary = (
+            f"profile_eval_wall_ms:{eval_wall_ms:.2f} eval_loss:{eval_loss.item():.4f}\n"
+            f"profile_train_wall_ms:{train_wall_ms:.2f} train_loss:{train_loss.item():.4f}\n"
+            f"profile_eval_table:{eval_table_path}\n"
+            f"profile_train_table:{train_table_path}\n"
+            f"profile_eval_trace:{eval_rank_path}\n"
+            f"profile_train_trace:{train_rank_path}\n"
+        )
+        print(summary, end='')
+        print("eval profiler top CUDA ops:")
+        print(eval_table)
+        print("train profiler top CUDA ops:")
+        print(train_table)
+        with open(logfile, "a") as f:
+            f.write(summary)
+        if wandb_run is not None:
+            wandb_run.log({
+                'profile_eval_wall_ms': eval_wall_ms,
+                'profile_train_wall_ms': train_wall_ms,
+                'profile_eval_loss': float(eval_loss.item()),
+                'profile_train_loss': float(train_loss.item()),
+            })
+            wandb_run.finish()
+
+    dist.destroy_process_group()
+    sys.exit(0)
+
 training_time_ms = 0
+time_limit_hit = False
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
+wall_train_start = time.time()
 # begin training
 train_loader.reset()
 for step in range(args.num_iterations + 1):
+    if max_train_seconds > 0 and (time.time() - wall_train_start) >= max_train_seconds:
+        time_limit_hit = True
+        if master_process:
+            elapsed = time.time() - wall_train_start
+            print(f"time limit reached ({max_train_seconds:.0f}s wall, elapsed {elapsed:.1f}s), stopping at step {step}")
+            with open(logfile, "a") as f:
+                f.write(f"time_limit_hit:1 elapsed_wall_s:{elapsed:.1f} stop_step:{step}\n")
+        break
     last_step = (step == args.num_iterations)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
@@ -519,28 +776,7 @@ for step in range(args.num_iterations + 1):
         break
 
     # --------------- TRAINING SECTION BEGIN -----------------
-    model.train()
-    for i in range(1, train_accumulation_steps+1):
-        # forward pass
-        with ctx:
-            _, loss = model(x, y, return_logits=False)
-            train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
-        # backward pass
-        if i < train_accumulation_steps:
-            with model.no_sync(): # there's no need to sync gradients every accumulation step
-                loss.backward()
-        else:
-            loss.backward() # just sync on the last step
-    for p in model.parameters():
-        p.grad /= train_accumulation_steps
-    # step the optimizers and schedulers
-    for opt, sched in zip(optimizers, schedulers):
-        opt.step()
-        sched.step()
-    # null the gradients
-    model.zero_grad(set_to_none=True)
+    x, y, train_loss = run_train_step(x, y)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
 
@@ -559,8 +795,11 @@ for step in range(args.num_iterations + 1):
 
 if master_process:
     if wandb_run is not None:
+        if time_limit_hit:
+            wandb_run.log({'time_limit_hit': True})
         wandb_run.finish()
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
+    build_ab_dashboard()
 
 # -------------------------------------------------------------------------
 # clean up nice
