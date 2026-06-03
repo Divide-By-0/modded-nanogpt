@@ -115,6 +115,9 @@ def _details_from_settings(settings):
         'weight_decay',
         'muon_lr_multiplier',
         'muon_momentum',
+        'muon_variant',
+        'muon_beta2',
+        'aurora_beta',
         'muon_nesterov',
         'muon_backend_steps',
         'qk_norm_mode',
@@ -203,6 +206,10 @@ def parse_log_file(path):
     for m in VAL_RE.finditer(text):
         series.val_steps.append(int(m.group(1)))
         series.val_losses.append(float(m.group(2)))
+    avgs = STEP_AVG_RE.findall(text)
+    if avgs:
+        # last reported step_avg is the steady-state latency (early steps are excluded by the trainer)
+        series.step_avg_ms = float(avgs[-1])
     if not series.train_steps and not series.val_steps:
         return None
     return series
@@ -256,6 +263,10 @@ def load_runs_from_wandb():
                 source=str(run.name or ''),
                 status=str(run.state or ''),
             )
+            if 'step_avg_ms' in hist.columns:
+                col = hist['step_avg_ms'].dropna()
+                if not col.empty:
+                    series.step_avg_ms = float(col.iloc[-1])
             if 'train_loss' in hist.columns and '_step' in hist.columns:
                 mask = hist['train_loss'].notna()
                 series.train_steps = hist.loc[mask, '_step'].astype(int).tolist()
@@ -307,9 +318,16 @@ def plot_runs(runs, out_path):
     for row, (grp_title, grp) in enumerate(groups):
         ax_t, ax_v = axes[row][0], axes[row][1]
         for series in grp:
-            # label each curve with its final val loss so the legend doubles as a ranking key.
+            # annotate each curve with final val loss + avg ms/step, so the legend doubles as a
+            # ranking key AND shows the latency cost of each variant (e.g. Aurora's heavier kernel).
             fv = _final(series.val_losses)
-            lab = series.label if fv is None else f'{series.label}  [val {fv:.4f}]'
+            ms = series.step_avg_ms
+            tag = []
+            if fv is not None:
+                tag.append(f'val {fv:.4f}')
+            if ms:
+                tag.append(f'{ms:.0f} ms/step')
+            lab = series.label if not tag else f'{series.label}  [{", ".join(tag)}]'
             if series.train_steps:
                 ax_t.plot(series.train_steps, series.train_losses, label=lab, alpha=0.9, linewidth=0.9)
             if series.val_steps:
@@ -351,6 +369,7 @@ def plot_runs(runs, out_path):
             + cell(s.main_change, escape(s.main_change))
             + cell(fv, _fmt(fv), numeric=True)
             + cell(ft, _fmt(ft), numeric=True)
+            + cell(s.step_avg_ms, _fmt(s.step_avg_ms, 1), numeric=True)
             + cell(s.val_steps[-1] if s.val_steps else None, numeric=True)
             + cell(s.train_steps[-1] if s.train_steps else None, numeric=True)
             + cell(len(s.val_steps), numeric=True)
@@ -364,6 +383,7 @@ def plot_runs(runs, out_path):
     headers = [
         ('label', False), ('main change', False),
         ('final val loss', True), ('final train loss', True),
+        ('avg ms/step', True),
         ('last val step', True), ('last train step', True),
         ('val pts', True), ('train pts', True),
         ('status', False), ('settings', False), ('source', False),
