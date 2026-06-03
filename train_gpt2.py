@@ -49,7 +49,49 @@ def zeropower_via_newtonschulz5(G, steps=10, eps=1e-7):
         X = X.T
     return X
 
-zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5)
+@torch.compile
+def zeropower_via_aurora(G, steps=2, beta=0.5, eps=1e-7):
+    """
+    Aurora (Tilde Research) leverage-aware orthogonalization. Vanilla Muon applies a single
+    polar factor polar(M); on TALL matrices (m>n, e.g. MLP up/gate projections) that leaves
+    anisotropic row norms ("leverage"). Aurora interleaves, for K outer iterations, a damped
+    row-norm rescale with a polar step so every row leverage is driven toward sqrt(n/m):
+
+        D_k = D_{k-1}^beta * diag(rownorm(X_k))^(1-beta)   (D_0 = I)
+        X~  = sqrt(n/m) * D_k^{-1} X_k
+        X_{k+1} = polar(X~)
+
+    REASON: polar(.) here reuses the same quintic Newton-Schulz Muon uses (a polar approximation);
+    we run it on the smaller Gram dimension for speed. NOTE: Aurora's paper LR (~0.0375-0.05) is far
+    higher than this repo's Muon LR convention, so the aurora variant needs its own LR sweep -- do not
+    reuse the muon LR multiplier blindly. Defaults steps=2, beta=0.5 per the nanoGPT speedrun result.
+    """
+    assert len(G.shape) == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= (X.norm() + eps)
+    transposed = X.size(0) < X.size(1)  # work in tall (m>=n) orientation so rows carry the leverage
+    if transposed:
+        X = X.T
+    m, n = X.shape
+    target = (n / m) ** 0.5
+    D = torch.ones(m, device=X.device, dtype=X.dtype)
+    for _ in range(steps):
+        r = X.norm(dim=1) + eps                   # per-row norms (leverage proxy)
+        D = D.pow(beta) * r.pow(1.0 - beta)       # damped leverage accumulation across iters
+        Y = target * (X / D[:, None])             # row-rescaled, Frobenius-preserving
+        # polar(Y) via quintic Newton-Schulz; iterate on Y^T (n<=m) keeping the Gram matrix small.
+        Z = Y.T / (Y.norm() + eps)                # Z is n x m, n<=m
+        for _ in range(5):
+            A = Z @ Z.T
+            B = A @ Z
+            Z = a * Z + b * B + c * A @ B
+        X = Z.T
+    if transposed:
+        X = X.T
+    return X
+
+zeropower_backends = dict(svd=zeropower_via_svd, newtonschulz5=zeropower_via_newtonschulz5, aurora=zeropower_via_aurora)
 
 class Muon(torch.optim.Optimizer):
     """
@@ -78,8 +120,13 @@ class Muon(torch.optim.Optimizer):
     """
     def __init__(self, params, lr=3e-4, momentum=0.95, nesterov=True,
                  backend='newtonschulz5', backend_steps=5,
+                 variant='muon', beta2=0.95, eps=1e-8, aurora_beta=0.5,
                  rank=0, world_size=1):
-        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend, backend_steps=backend_steps)
+        # variant: 'muon' (vanilla), 'muon2' (Adam-style 2nd-moment preconditioning before
+        # orthogonalization), or 'aurora' (leverage-aware orthogonalization for tall matrices).
+        defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, backend=backend,
+                        backend_steps=backend_steps, variant=variant, beta2=beta2, eps=eps,
+                        aurora_beta=aurora_beta)
         super().__init__(params, defaults)
         self.rank = rank
         self.world_size = world_size
@@ -90,7 +137,10 @@ class Muon(torch.optim.Optimizer):
 
             lr = group['lr']
             momentum = group['momentum']
-            zeropower_backend = zeropower_backends[group['backend']]
+            variant = group['variant']
+            # Aurora swaps the orthogonalization backend; muon/muon2 keep the configured one.
+            backend_name = 'aurora' if variant == 'aurora' else group['backend']
+            zeropower_backend = zeropower_backends[backend_name]
 
             # generate weight updates in distributed fashion
             total_params = sum(p.numel() for p in group['params'])
@@ -109,8 +159,43 @@ class Muon(torch.optim.Optimizer):
                     buf.mul_(momentum).add_(g)
                     if group['nesterov']:
                         g = g.add(buf, alpha=momentum)
-                    g = zeropower_backend(g, steps=group['backend_steps'])
-                    g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
+                    if variant == 'muon2':
+                        # Muon2: Adam-style per-element second-moment preconditioning of the
+                        # momentum BEFORE orthogonalization (M~ = M / (sqrt(V)+eps)). V tracks the
+                        # raw gradient's second moment. This re-scales coordinates so the polar step
+                        # orthogonalizes a better-conditioned matrix; NorMuon/AdaMuon do this AFTER
+                        # the polar step instead -- we follow the Muon2 paper (before).
+                        if 'v_buffer' not in state:
+                            state['v_buffer'] = torch.zeros_like(p.grad)
+                        v = state['v_buffer']
+                        v.mul_(group['beta2']).addcmul_(p.grad, p.grad, value=1.0 - group['beta2'])
+                        g = g / (v.sqrt() + group['eps'])
+                    if backend_name == 'aurora':
+                        g = zeropower_backend(g, steps=group['backend_steps'], beta=group['aurora_beta'])
+                    else:
+                        g = zeropower_backend(g, steps=group['backend_steps'])
+                    if variant in ('adamuon', 'normuon'):
+                        # Post-orthogonalization adaptive second moment -- the recipe that actually
+                        # WINS in practice (AdaMuon / NorMuon), unlike the Muon2 paper's pre-NS scaling
+                        # which cancels under the polar normalization. We scale the ALREADY-orthogonal
+                        # update O by a bias-corrected RMS, then re-normalize the whole update back to
+                        # RMS==1 so the existing muon_lr_multiplier transfers with no retuning.
+                        #   adamuon -> element-wise second moment;  normuon -> per output-row (neuron).
+                        beta2 = group['beta2']; eps = group['eps']
+                        t = state.get('muon2_t', 0) + 1
+                        state['muon2_t'] = t
+                        o = g.float()  # accumulate 2nd moment in fp32; bf16 squares underflow
+                        sq = (o * o) if variant == 'adamuon' else (o * o).mean(dim=1, keepdim=True)
+                        if 'v2_buffer' not in state or state['v2_buffer'].shape != sq.shape:
+                            state['v2_buffer'] = torch.zeros_like(sq)
+                        v2 = state['v2_buffer']
+                        v2.mul_(beta2).add_(sq, alpha=1.0 - beta2)
+                        vhat = v2 / (1.0 - beta2 ** t)                 # Adam-style bias correction
+                        o = o / (vhat.sqrt() + eps)
+                        o = o * (o.numel() ** 0.5 / (o.norm() + eps))  # RMS-align: update.square().mean()==1
+                        g = o.type_as(g)
+                    else:
+                        g *= max(g.size(0), g.size(1))**0.5 # scale to have update.square().mean() == 1
                     updates_flat[curr_idx:curr_idx+p.numel()] = g.flatten()
                 curr_idx += p.numel()
 
@@ -404,6 +489,18 @@ muon_lr_multiplier = float(os.environ.get('MUON_LR_MULTIPLIER', '0.1'))
 muon_momentum = float(os.environ.get('MUON_MOMENTUM', '0.95'))
 muon_nesterov = env_bool('MUON_NESTEROV', True)
 muon_backend_steps = int(os.environ.get('MUON_BACKEND_STEPS', '5'))
+# MUON_VARIANT: 'muon' (vanilla), 'muon2' (paper: 2nd-moment preconditioning BEFORE
+# orthogonalization), 'adamuon'/'normuon' (practical: bias-corrected 2nd moment AFTER
+# orthogonalization + RMS realignment; element-wise vs per-neuron), 'aurora' (leverage-aware
+# orthogonalization for tall matrices).
+muon_variant = os.environ.get('MUON_VARIANT', 'muon').strip().lower()
+# beta2 default 0.999 follows AdaMuon/NorMuon ("typically close to 1"); muon2 paper used ~0.95.
+muon_beta2 = float(os.environ.get('MUON_BETA2', '0.999'))
+muon_eps = float(os.environ.get('MUON_EPS', '1e-8'))       # 2nd-moment preconditioner epsilon
+aurora_beta = float(os.environ.get('AURORA_BETA', '0.5'))  # aurora row-leverage damping
+_muon_variants = ('muon', 'muon2', 'adamuon', 'normuon', 'aurora')
+if muon_variant not in _muon_variants:
+    raise ValueError(f"MUON_VARIANT must be one of {_muon_variants}; got {muon_variant!r}")
 qk_norm_mode = os.environ.get('QK_NORM_MODE', 'before_rope').strip().lower()
 embed_rmsnorm = env_bool('EMBED_RMSNORM', False)
 torch_compile_mode = os.environ.get('TORCH_COMPILE_MODE', '').strip() or None
@@ -424,11 +521,28 @@ def maybe_init_wandb(run_id, run_config=None):
   api_key = os.environ.get('WANDB_API_KEY')
   if not api_key:
     return None
-  import wandb
-  wandb.login(key=api_key, relogin=True)
-  config = dict(vars(args))
-  if run_config:
-    config.update(run_config)
+  # REASON: never let a wandb problem kill an expensive GPU run. Two real failure
+  # modes seen on the RunPod box: (1) a stale ./wandb run-data directory in CWD
+  # shadows the installed package as a namespace package, so `import wandb` yields a
+  # module with no .login/.init (AttributeError); (2) transient pod network loss makes
+  # wandb.login() raise. Either way we warn, fall back to local-log-only, and keep
+  # training — the A/B dashboard is rebuilt from logs/*.txt and can backfill W&B later.
+  try:
+    import wandb
+    if not hasattr(wandb, 'login') or not hasattr(wandb, 'init'):
+      raise RuntimeError(
+        f"imported 'wandb' from {getattr(wandb, '__file__', '?')} is not the real package "
+        "(likely a ./wandb directory shadowing it on sys.path); skipping W&B logging")
+    wandb.login(key=api_key, relogin=True)
+    config = dict(vars(args))
+    if run_config:
+      config.update(run_config)
+    return wandb_init(wandb, run_id, config)
+  except Exception as e:
+    print(f"[wandb] disabled for this run: {type(e).__name__}: {e}")
+    return None
+
+def wandb_init(wandb, run_id, config):
   return wandb.init(
     project=os.environ.get('WANDB_PROJECT', 'modded-nanogpt'),
     name=os.environ.get('WANDB_RUN_NAME', run_id),
@@ -503,7 +617,9 @@ if optimizer_mode == 'muon_adamw':
                                    weight_decay=args.weight_decay, fused=True)
     optimizer2 = Muon(raw_model.transformer.h.parameters(), lr=muon_lr_multiplier*args.learning_rate,
                       momentum=muon_momentum, nesterov=muon_nesterov,
-                      backend_steps=muon_backend_steps, rank=ddp_rank, world_size=ddp_world_size)
+                      backend_steps=muon_backend_steps, variant=muon_variant,
+                      beta2=muon_beta2, eps=muon_eps, aurora_beta=aurora_beta,
+                      rank=ddp_rank, world_size=ddp_world_size)
     optimizers = [optimizer1, optimizer2]
 elif optimizer_mode == 'adamw_all':
     optimizers = [torch.optim.AdamW(raw_model.parameters(), lr=args.learning_rate, betas=(0.9, 0.95),
@@ -591,6 +707,9 @@ if master_process:
         'optimizer_mode': optimizer_mode,
         'muon_lr_multiplier': muon_lr_multiplier,
         'muon_momentum': muon_momentum,
+        'muon_variant': muon_variant,
+        'muon_beta2': muon_beta2,
+        'aurora_beta': aurora_beta,
         'muon_nesterov': muon_nesterov,
         'muon_backend_steps': muon_backend_steps,
         'qk_norm_mode': qk_norm_mode,
@@ -611,6 +730,9 @@ if master_process:
         f.write(f"optimizer_mode:{optimizer_mode}\n")
         f.write(f"muon_lr_multiplier:{muon_lr_multiplier}\n")
         f.write(f"muon_momentum:{muon_momentum}\n")
+        f.write(f"muon_variant:{muon_variant}\n")
+        f.write(f"muon_beta2:{muon_beta2}\n")
+        f.write(f"aurora_beta:{aurora_beta}\n")
         f.write(f"muon_nesterov:{muon_nesterov}\n")
         f.write(f"muon_backend_steps:{muon_backend_steps}\n")
         f.write(f"qk_norm_mode:{qk_norm_mode}\n")
@@ -768,7 +890,11 @@ for step in range(args.num_iterations + 1):
         torch.cuda.synchronize()
         t0 = time.time()
 
-    if master_process and (last_step or (args.save_every > 0 and step % args.save_every == 0)):
+    # REASON: only checkpoint when save_every>0 is explicitly requested. Upstream also saved a
+    # final checkpoint at last_step even with save_every==0, which for these A/B sweeps wrote a
+    # ~1 GB model+optimizer .pt PER RUN (16 runs -> 18 GB of useless state filling the pod disk
+    # and bloating result pulls). The sweeps only compare loss curves, so default to NOT saving.
+    if master_process and args.save_every > 0 and (last_step or step % args.save_every == 0):
         # stop the clock
         torch.cuda.synchronize()
         training_time_ms += 1000 * (time.time() - t0)

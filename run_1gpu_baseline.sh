@@ -3,6 +3,14 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 export WANDB_PROJECT="${WANDB_PROJECT:-modded-nanogpt}"
+# REASON: wandb writes its run-data dir to $WANDB_DIR/wandb (default: CWD -> ./wandb).
+# A ./wandb dir in the repo root is dangerous here: if wandb is ever NOT pip-installed,
+# `import wandb` silently resolves to that empty dir as a PEP-420 namespace package
+# (wandb.__file__ is None, no .login) instead of erroring -- which both crashes runs at
+# wandb.login() and tricks `if ! python -c 'import wandb'` install-guards into skipping
+# the install. Park run-data outside the repo so the repo dir never shadows the package.
+export WANDB_DIR="${WANDB_DIR:-/tmp/wandb-modded}"
+mkdir -p "$WANDB_DIR"
 export AB_TAG="${AB_TAG:-baseline}"
 export MAX_TRAIN_SECONDS="${MAX_TRAIN_SECONDS:-120}"
 export TRAIN_SEED="${TRAIN_SEED:-1337}"

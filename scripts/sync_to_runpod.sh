@@ -41,6 +41,7 @@ rsync -az --no-owner --no-group --omit-dir-times \
   --exclude '.git' \
   --exclude 'records' \
   --exclude 'logs' \
+  --exclude 'wandb' \
   --exclude 'data/fineweb10B/*.bin' \
   --exclude 'data/fineweb10B/.cache' \
   "$SRC/" "root@${IP}:/workspace/modded-nanogpt/"

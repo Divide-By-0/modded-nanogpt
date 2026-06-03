@@ -30,6 +30,9 @@ META_RE = {
     'weight_decay': re.compile(r'^weight_decay:(.*)$', re.M),
     'muon_lr_multiplier': re.compile(r'^muon_lr_multiplier:(.*)$', re.M),
     'muon_momentum': re.compile(r'^muon_momentum:(.*)$', re.M),
+    'muon_variant': re.compile(r'^muon_variant:(.*)$', re.M),
+    'muon_beta2': re.compile(r'^muon_beta2:(.*)$', re.M),
+    'aurora_beta': re.compile(r'^aurora_beta:(.*)$', re.M),
     'muon_nesterov': re.compile(r'^muon_nesterov:(.*)$', re.M),
     'muon_backend_steps': re.compile(r'^muon_backend_steps:(.*)$', re.M),
     'qk_norm_mode': re.compile(r'^qk_norm_mode:(.*)$', re.M),
@@ -86,6 +89,8 @@ def _label_from_settings(settings, path):
         parts.append(f'NS={settings["muon_backend_steps"]}')
     if settings.get('muon_momentum'):
         parts.append(f'mom={settings["muon_momentum"]}')
+    if settings.get('muon_variant') and settings['muon_variant'] != 'muon':
+        parts.append(f'variant={settings["muon_variant"]}')
     if settings.get('muon_lr_multiplier'):
         parts.append(f'muon_lr={settings["muon_lr_multiplier"]}x')
     if settings.get('qk_norm_mode'):
@@ -264,65 +269,138 @@ def load_runs_from_wandb():
     return runs
 
 
+def _final(values):
+    return values[-1] if values else None
+
+
+def _fmt(v, nd=4):
+    return f'{v:.{nd}f}' if isinstance(v, (int, float)) else ''
+
+
 def plot_runs(runs, out_path):
     import matplotlib
     matplotlib.use('Agg')
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+    # REASON: render the figure as inline SVG (vector) rather than a base64 PNG. SVG stays
+    # razor-sharp at any browser zoom and on HiDPI/Retina displays, which the old dpi=120 PNG
+    # did not. Point count here is tiny (a handful of val points per run) so SVG size is small.
+    # A larger figure + readable fonts further help legibility with many overlaid runs.
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
     for series in runs:
+        # label each curve with its final val loss so the legend doubles as a ranking key.
+        fv = _final(series.val_losses)
+        lab = series.label if fv is None else f'{series.label}  [val {fv:.4f}]'
         if series.train_steps:
-            axes[0].plot(series.train_steps, series.train_losses, label=series.label, alpha=0.78, linewidth=0.9)
+            axes[0].plot(series.train_steps, series.train_losses, label=lab, alpha=0.9, linewidth=0.9)
         if series.val_steps:
-            axes[1].plot(series.val_steps, series.val_losses, label=series.label, alpha=0.78, linewidth=0.9, marker='o', markersize=2)
-    axes[0].set_title('train_loss')
-    axes[0].set_xlabel('step')
-    axes[0].set_ylabel('loss')
-    axes[0].legend(fontsize=7)
-    axes[0].grid(True, alpha=0.3)
-    axes[1].set_title('val_loss')
-    axes[1].set_xlabel('step')
-    axes[1].set_ylabel('loss')
-    axes[1].legend(fontsize=7)
-    axes[1].grid(True, alpha=0.3)
+            axes[1].plot(series.val_steps, series.val_losses, label=lab, alpha=0.9, linewidth=0.9, marker='o', markersize=2.5)
+    for ax, title in ((axes[0], 'train_loss'), (axes[1], 'val_loss')):
+        ax.set_title(title, fontsize=14)
+        ax.set_xlabel('step', fontsize=12)
+        ax.set_ylabel('loss', fontsize=12)
+        ax.legend(fontsize=8, loc='upper right')
+        ax.grid(True, which='both', alpha=0.3)
+        ax.tick_params(labelsize=10)
     fig.tight_layout()
 
-    buf = io.BytesIO()
-    fig.savefig(buf, format='png', dpi=120)
+    buf = io.StringIO()
+    fig.savefig(buf, format='svg')
     plt.close(fig)
-    buf.seek(0)
-    img_b64 = base64.b64encode(buf.read()).decode('ascii')
+    svg = buf.getvalue()
+    # Strip the XML/doctype preamble so the <svg> can be inlined directly into the HTML body
+    # (inline SVG scales responsively and avoids the blur of a rasterized data-URI image).
+    idx = svg.find('<svg')
+    svg_inline = svg[idx:] if idx != -1 else svg
 
-    rows = ''.join(
-        '<tr>'
-        f'<td>{escape(s.label)}</td>'
-        f'<td>{escape(s.main_change)}</td>'
-        f'<td>{escape(s.details)}</td>'
-        f'<td>{escape(s.source)}</td>'
-        f'<td>{escape(s.status)}</td>'
-        f'<td>{len(s.train_steps)}</td>'
-        f'<td>{len(s.val_steps)}</td>'
-        f'<td>{s.train_steps[-1] if s.train_steps else ""}</td>'
-        f'<td>{s.val_steps[-1] if s.val_steps else ""}</td>'
-        '</tr>'
-        for s in runs
+    # Default ranking: best (lowest) final val loss first; runs without val data sink to the bottom.
+    ranked = sorted(runs, key=lambda s: (_final(s.val_losses) is None, _final(s.val_losses) or 0.0))
+
+    def cell(value, display=None, numeric=False):
+        disp = display if display is not None else ('' if value is None else escape(str(value)))
+        sortv = '' if value is None else escape(str(value))
+        num_attr = ' data-numeric="1"' if numeric else ''
+        return f'<td data-v="{sortv}"{num_attr}>{disp}</td>'
+
+    rows = ''
+    for s in ranked:
+        fv = _final(s.val_losses)
+        ft = _final(s.train_losses)
+        rows += (
+            '<tr>'
+            + cell(s.label, escape(s.label))
+            + cell(s.main_change, escape(s.main_change))
+            + cell(fv, _fmt(fv), numeric=True)
+            + cell(ft, _fmt(ft), numeric=True)
+            + cell(s.val_steps[-1] if s.val_steps else None, numeric=True)
+            + cell(s.train_steps[-1] if s.train_steps else None, numeric=True)
+            + cell(len(s.val_steps), numeric=True)
+            + cell(len(s.train_steps), numeric=True)
+            + cell(s.status, escape(s.status))
+            + cell(s.details, escape(s.details))
+            + cell(s.source, escape(s.source))
+            + '</tr>'
+        )
+
+    headers = [
+        ('label', False), ('main change', False),
+        ('final val loss', True), ('final train loss', True),
+        ('last val step', True), ('last train step', True),
+        ('val pts', True), ('train pts', True),
+        ('status', False), ('settings', False), ('source', False),
+    ]
+    # column index 2 (final val loss) is the default sort, ascending.
+    header_html = ''.join(
+        f'<th onclick="sortTable(this,{i},{str(num).lower()})" title="click to sort">{escape(name)} &#8597;</th>'
+        for i, (name, num) in enumerate(headers)
     )
+
     html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>modded-nanogpt A/B dashboard</title>
 <style>
 body {{ font-family: system-ui, sans-serif; margin: 24px; background: #111; color: #eee; }}
-img {{ max-width: 100%; height: auto; background: #fff; border-radius: 8px; }}
-table {{ border-collapse: collapse; margin-top: 16px; }}
-td, th {{ border: 1px solid #444; padding: 8px 12px; }}
+.plot {{ background: #fff; border-radius: 8px; padding: 8px; }}
+.plot svg {{ width: 100%; height: auto; display: block; }}
+table {{ border-collapse: collapse; margin-top: 16px; width: 100%; }}
+td, th {{ border: 1px solid #444; padding: 6px 10px; }}
 td {{ vertical-align: top; font-size: 13px; }}
-th {{ font-size: 13px; }}
+th {{ font-size: 13px; cursor: pointer; user-select: none; background: #1d1d1d; position: sticky; top: 0; }}
+th:hover {{ background: #2a2a2a; }}
+tbody tr:nth-child(odd) {{ background: #161616; }}
+td[data-numeric] {{ text-align: right; font-variant-numeric: tabular-nums; }}
+tbody tr:first-child td[data-v]:nth-child(3) {{ font-weight: 700; color: #6fdc6f; }}
 </style></head><body>
 <h1>modded-nanogpt A/B loss comparison</h1>
-<p>Runs: {len(runs)} — logs from <code>{LOGS_DIR}</code>. Legacy logs without settings metadata are hidden; set <code>SHOW_LEGACY_RUNS=1</code> to include them. Repeated runs with the same <code>ab_tag</code> are de-duped to the newest log; set <code>SHOW_DUPLICATE_RUNS=1</code> to include repeats.</p>
-<img alt="train and val loss" src="data:image/png;base64,{img_b64}">
-<table><tr><th>label</th><th>main change</th><th>settings</th><th>source</th><th>status</th><th>train points</th><th>val points</th><th>last train step</th><th>last val step</th></tr>
+<p>Runs: {len(runs)} — logs from <code>{LOGS_DIR}</code>. Table is sorted by <b>final val loss</b> (click any header to re-sort). Legacy logs without settings metadata are hidden (<code>SHOW_LEGACY_RUNS=1</code> to include). Same-<code>ab_tag</code> reruns de-duped to newest (<code>SHOW_DUPLICATE_RUNS=1</code> to include).</p>
+<div class="plot">{svg_inline}</div>
+<table id="runs"><thead><tr>{header_html}</tr></thead>
+<tbody>
 {rows}
-</table></body></html>"""
+</tbody></table>
+<script>
+function sortTable(th, col, numeric) {{
+  const table = document.getElementById('runs');
+  const tbody = table.tBodies[0];
+  const rows = Array.from(tbody.rows);
+  const cur = table.getAttribute('data-sortcol');
+  const dir = (cur == col && table.getAttribute('data-sortdir') == 'asc') ? 'desc' : 'asc';
+  rows.sort((a, b) => {{
+    let x = a.cells[col].getAttribute('data-v');
+    let y = b.cells[col].getAttribute('data-v');
+    if (numeric) {{
+      x = (x === '' || x === null) ? Infinity : parseFloat(x);
+      y = (y === '' || y === null) ? Infinity : parseFloat(y);
+      return dir == 'asc' ? x - y : y - x;
+    }}
+    x = (x || '').toLowerCase(); y = (y || '').toLowerCase();
+    return dir == 'asc' ? (x > y ? 1 : x < y ? -1 : 0) : (x < y ? 1 : x > y ? -1 : 0);
+  }});
+  rows.forEach(r => tbody.appendChild(r));
+  table.setAttribute('data-sortcol', col);
+  table.setAttribute('data-sortdir', dir);
+}}
+</script>
+</body></html>"""
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, 'w', encoding='utf-8') as f:
         f.write(html)
