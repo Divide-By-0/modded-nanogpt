@@ -388,6 +388,13 @@ if (weight_decay_env := os.environ.get('WEIGHT_DECAY')) is not None:
 
 train_seed = int(os.environ.get('TRAIN_SEED', '1337'))
 max_train_seconds = float(os.environ.get('MAX_TRAIN_SECONDS', '0'))
+# NOTE: MAX_TRAIN_STEPS caps the loop at N optimizer steps for cheap early-curve
+# A/B sweeps. We deliberately DO NOT shrink args.num_iterations: get_lr()'s warmdown
+# denominator stays at the real 5100-step schedule, so the first N steps see exactly
+# the LR they'd see in a full run. Shrinking num_iterations instead would make
+# warmdown kick in immediately (since 50 < warmdown_iters=1450) and the curves would
+# no longer be comparable to the real run. 0 = disabled.
+max_train_steps = int(os.environ.get('MAX_TRAIN_STEPS', '0'))
 ab_tag = os.environ.get('AB_TAG', '')
 experiment_desc = os.environ.get('EXPERIMENT_DESC', '')
 profile_one_step = env_bool('PROFILE_ONE_STEP', False)
@@ -576,6 +583,7 @@ if master_process:
         'experiment_desc': experiment_desc,
         'train_seed': train_seed,
         'max_train_seconds': max_train_seconds,
+        'max_train_steps': max_train_steps,
         'learning_rate': args.learning_rate,
         'warmup_iters': args.warmup_iters,
         'warmdown_iters': args.warmdown_iters,
@@ -595,6 +603,7 @@ if master_process:
         f.write(f"experiment_desc:{experiment_desc}\n")
         f.write(f"train_seed:{train_seed}\n")
         f.write(f"max_train_seconds:{max_train_seconds}\n")
+        f.write(f"max_train_steps:{max_train_steps}\n")
         f.write(f"learning_rate:{args.learning_rate}\n")
         f.write(f"warmup_iters:{args.warmup_iters}\n")
         f.write(f"warmdown_iters:{args.warmdown_iters}\n")
@@ -716,7 +725,9 @@ for step in range(args.num_iterations + 1):
             with open(logfile, "a") as f:
                 f.write(f"time_limit_hit:1 elapsed_wall_s:{elapsed:.1f} stop_step:{step}\n")
         break
-    last_step = (step == args.num_iterations)
+    # MAX_TRAIN_STEPS cap: treat the Nth step as the last so we still run one final
+    # validation/log pass before breaking (the eval + `if last_step: break` below).
+    last_step = (step == args.num_iterations) or (max_train_steps > 0 and step == max_train_steps)
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
