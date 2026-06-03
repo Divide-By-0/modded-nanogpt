@@ -39,6 +39,7 @@ META_RE = {
     'embed_rmsnorm': re.compile(r'^embed_rmsnorm:(.*)$', re.M),
 }
 STOP_RE = re.compile(r'time_limit_hit:1 elapsed_wall_s:([\d.]+) stop_step:(\d+)')
+STEP_AVG_RE = re.compile(r'step_avg:([\d.]+)ms')
 
 
 @dataclass
@@ -50,6 +51,7 @@ class RunSeries:
     details: str = ''
     source: str = ''
     status: str = ''
+    step_avg_ms: float = None  # steady-state avg wall-time per train step (latency)
     train_steps: list = field(default_factory=list)
     train_losses: list = field(default_factory=list)
     val_steps: list = field(default_factory=list)
@@ -286,22 +288,39 @@ def plot_runs(runs, out_path):
     # razor-sharp at any browser zoom and on HiDPI/Retina displays, which the old dpi=120 PNG
     # did not. Point count here is tiny (a handful of val points per run) so SVG size is small.
     # A larger figure + readable fonts further help legibility with many overlaid runs.
-    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
-    for series in runs:
-        # label each curve with its final val loss so the legend doubles as a ranking key.
-        fv = _final(series.val_losses)
-        lab = series.label if fv is None else f'{series.label}  [val {fv:.4f}]'
-        if series.train_steps:
-            axes[0].plot(series.train_steps, series.train_losses, label=lab, alpha=0.9, linewidth=0.9)
-        if series.val_steps:
-            axes[1].plot(series.val_steps, series.val_losses, label=lab, alpha=0.9, linewidth=0.9, marker='o', markersize=2.5)
-    for ax, title in ((axes[0], 'train_loss'), (axes[1], 'val_loss')):
-        ax.set_title(title, fontsize=14)
-        ax.set_xlabel('step', fontsize=12)
-        ax.set_ylabel('loss', fontsize=12)
-        ax.legend(fontsize=8, loc='upper right')
-        ax.grid(True, which='both', alpha=0.3)
-        ax.tick_params(labelsize=10)
+    #
+    # Split short A/B sweeps from full-length runs onto SEPARATE rows. Mixing a 50-step sweep with
+    # a 300+ step run on one x-axis squishes the sweeps into the left edge; each group gets its own
+    # x-scale instead. Threshold via SHORT_STEP_MAX (default 60: a 50-step sweep is "short").
+    short_max = int(os.environ.get('SHORT_STEP_MAX', '60'))
+
+    def _max_step(s):
+        steps = (s.val_steps or []) + (s.train_steps or [])
+        return max(steps) if steps else 0
+
+    short = [s for s in runs if _max_step(s) <= short_max]
+    long = [s for s in runs if _max_step(s) > short_max]
+    groups = [(f'≤{short_max}-step A/B sweeps', short)] + ([('full-length / 5-min runs', long)] if long else [])
+
+    nrows = len(groups)
+    fig, axes = plt.subplots(nrows, 2, figsize=(20, 7 * nrows), squeeze=False)
+    for row, (grp_title, grp) in enumerate(groups):
+        ax_t, ax_v = axes[row][0], axes[row][1]
+        for series in grp:
+            # label each curve with its final val loss so the legend doubles as a ranking key.
+            fv = _final(series.val_losses)
+            lab = series.label if fv is None else f'{series.label}  [val {fv:.4f}]'
+            if series.train_steps:
+                ax_t.plot(series.train_steps, series.train_losses, label=lab, alpha=0.9, linewidth=0.9)
+            if series.val_steps:
+                ax_v.plot(series.val_steps, series.val_losses, label=lab, alpha=0.9, linewidth=0.9, marker='o', markersize=2.5)
+        for ax, metric in ((ax_t, 'train_loss'), (ax_v, 'val_loss')):
+            ax.set_title(f'{metric} — {grp_title} ({len(grp)} runs)', fontsize=14)
+            ax.set_xlabel('step', fontsize=12)
+            ax.set_ylabel('loss', fontsize=12)
+            ax.legend(fontsize=8, loc='upper right')
+            ax.grid(True, which='both', alpha=0.3)
+            ax.tick_params(labelsize=10)
     fig.tight_layout()
 
     buf = io.StringIO()
@@ -409,7 +428,13 @@ function sortTable(th, col, numeric) {{
 def main():
     os.chdir(REPO_ROOT)
     runs = load_runs_from_logs()
-    if not runs:
+    # Merge in W&B runs by default so full-length runs that aren't present as local logs (e.g. the
+    # older 300-600s runs) still appear on the dashboard. The dedup-by-key step below prefers the
+    # local copy (mtime>0) over the W&B copy (mtime=0) for any run present in both, so this only
+    # ADDS wandb-only runs. Set MERGE_WANDB=0 to use local logs only (faster; no API calls).
+    if os.environ.get('MERGE_WANDB', '1') != '0':
+        runs = runs + load_runs_from_wandb()
+    elif not runs:
         runs = load_runs_from_wandb()
     if not runs:
         print(f'No runs found under {LOGS_DIR}/*.txt (and no wandb history).', file=sys.stderr)
