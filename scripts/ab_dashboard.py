@@ -461,17 +461,25 @@ def main():
         return 1
     # De-dupe reruns of the same ablation by ab_tag by default. Set
     # SHOW_DUPLICATE_RUNS=1 when investigating repeated runs.
+    # REASON: rank by (#val points, mtime), NOT mtime alone. The old mtime-only rule kept a short
+    # local 50-step rerun over a longer same-key W&B run (mtime 0), so full-length runs vanished
+    # from the dashboard. Preferring the run with more data points surfaces the longest curve; mtime
+    # only breaks ties between equally-long reruns (-> newest).
+    def _rank(r):
+        return (len(r.val_steps), len(r.train_steps), r.mtime)
     if not os.environ.get('SHOW_DUPLICATE_RUNS'):
         by_key = {}
         for r in runs:
             prev = by_key.get(r.key)
-            if prev is None or r.mtime >= prev.mtime:
+            if prev is None or _rank(r) >= _rank(prev):
                 by_key[r.key] = r
         runs = list(by_key.values())
 
     by_label = {}
     for r in runs:
-        by_label[r.label] = r
+        prev = by_label.get(r.label)
+        if prev is None or _rank(r) >= _rank(prev):
+            by_label[r.label] = r
     runs = list(by_label.values())
     plot_runs(runs, OUT_HTML)
     print(f'Wrote {OUT_HTML} ({len(runs)} run(s))')
