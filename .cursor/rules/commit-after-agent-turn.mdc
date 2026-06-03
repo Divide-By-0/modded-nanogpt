@@ -1,0 +1,14 @@
+---
+description: Commit after each completed agent prompt or task when this repo changes.
+alwaysApply: true
+---
+
+# Commit After Agent Turn
+
+Cursor agents, background agents, and sub-agents should commit after each user prompt or completed agent task that changes tracked repo files, before handing control back.
+
+Use `.codex/skills/commit-after-agent-turn/SKILL.md` as the shared workflow. In short: inspect status and diff, stage only intended files, run a cheap relevant validation, scan staged content for secrets, commit with prompt/tool/timing provenance, and push when the current branch already has an upstream or active PR.
+
+Commit messages should include a redacted prompt summary, the agent/tool name, elapsed time when available, the changed files/behavior, and validation performed.
+
+Do not commit raw API keys, `.env` files, generated logs, caches, model weights, downloaded datasets, or unrelated user changes.

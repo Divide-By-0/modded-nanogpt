@@ -2,3 +2,7 @@ fineweb10B/
 pylog124M/
 __pycache__/
 logs/
+wandb/
+.env
+.env.*
+!.env.example
